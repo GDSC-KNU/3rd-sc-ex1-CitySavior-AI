@@ -1,111 +1,130 @@
-import json
-import pandas as pd
-from sklearn.preprocessing import LabelEncoder
-from keras.preprocessing.image import ImageDataGenerator
-import tensorflow as tf
 import os
+import math
+import numpy as np
+import pandas as pd
+import tensorflow as tf
+from keras import layers
+from keras.models import Model
+from keras.layers import GlobalAveragePooling2D, Conv2D, Activation,BatchNormalization, ReLU, Add, AveragePooling2D, Flatten, Dense, Input, Dropout
+from keras.regularizers import l2
+from keras.optimizers import SGD
+from keras.applications import ResNet50V2
+from keras.preprocessing.image import ImageDataGenerator
+from keras.callbacks import LearningRateScheduler, EarlyStopping
+from sklearn.model_selection import train_test_split
+from PIL import Image, UnidentifiedImageError
+from keras import optimizers, regularizers
 
-def get_image_labels(root_dir):
-    # 이미지 ID와 라벨 매핑을 위한 딕셔너리 생성
-    image_labels = {'file_name': [],'image_id': [], 'class': [], 'degree': []}
-    attrib_list = ['image_id', 'class', 'status', 'damagetype', 'degree']
-    attirb_dict = {'image_id':None, 'class': None, 'status': None, 'damagetype': None, 'degree': None}
-    for folder in os.listdir(root_dir):
-        folder_dir = os.path.join(root_dir, folder)
-        for label in os.listdir(folder_dir):
-            label_dir = os.path.join(folder_dir, label)
-            if '[라벨]' in label:
-                for file in os.listdir(label_dir):
-                    # JSON 파일 로드
-                    file_dir = os.path.join(label_dir, file)
-                    with open(file_dir) as f:
-                        data = json.load(f)
-                    # 이미지 ID와 라벨 매핑
-                    for annotation in data['annotations']:
-                        attributes = annotation['attributes']
-                        # 'class', 'status', 'damagetype', 'degree' 키 확인 및 값 가져오기
-                        for attrib in attrib_list:
-                            if attrib not in attributes:
-                                continue
-                            else:
-                                attirb_dict[attrib] = attributes.get(attrib)   
-                        
-                    # 클래스와 상태를 결합하여 라벨 생성 (None인 경우는 공백으로 처리)
-                    image_labels['image_id'].append(annotation['image_id']) 
-                    image_labels['class'].append(attirb_dict['class'])
-                    image_labels['degree'].append(attirb_dict['degree'])
-                    # 이미지 파일 이름과 라벨 매핑
-                    image_file_labels = {}
-                    for image in data['images']:
-                        image_id = image['id']
-                        file_name = image['file_name']
+# ImageDataGenerator 생성
+datagen_train = ImageDataGenerator(rescale=1./255)
+datagen_val = ImageDataGenerator(rescale=1./255)
 
-                        # 이미지 ID를 사용하여 라벨 찾기
-                        label = image_labels.get('image_id')[-1]
-                        if label == image_id:
-                            image_labels['file_name'].append(file_name)
-            else:
-                continue
-    del image_labels['image_id']    
-    return image_labels
+# flow_from_directory 함수를 이용하여 이미지 데이터를 불러옴
+train_generator = datagen_train.flow_from_directory(
+    directory='Dataset/Classified_Training',  # 훈련 데이터가 있는 폴더의 경로
+    target_size=(224, 224),  # 이미지 크기
+    batch_size=16,  # 배치 크기
+    class_mode='categorical', 
+    color_mode='rgb',  # 컬러 이미지이므로 'rgb'
+    shuffle=True  # 데이터를 섞음
+)
 
-image_labels = get_image_labels('Dataset\Training')
-# 데이터프레임 생성
-df = pd.DataFrame(image_labels)
-df.to_csv('image_labels.csv', index=False)
-print(df)
-# # 클래스 라벨을 숫자로 변환
-# le = LabelEncoder()
-# df['class'] = le.fit_transform(df['class'])
+validation_generator = datagen_val.flow_from_directory(
+    directory='Dataset/Classified_Validation',  # 검증 데이터가 있는 폴더의 경로
+    target_size=(224, 224),  # 이미지 크기
+    batch_size=16,  # 배치 크기
+    class_mode='categorical',  
+    color_mode='rgb',  # 컬러 이미지이므로 'rgb'
+    shuffle=True  # 데이터를 섞음
+)    
 
-# # ImageDataGenerator 생성
-# datagen = ImageDataGenerator(rescale=1./255, validation_split=0.2)
+epochs             = 70
+weight_decay       = 1.25e-4
 
-# # Train 데이터 불러오기
-# train_generator = datagen.flow_from_dataframe(
-#     df, 
-#     directory='Training/', 
-#     x_col='filename',
-#     y_col='class',
-#     target_size=(150, 150), 
-#     batch_size=32,
-#     class_mode='categorical',
-#     subset='training')
+def residual_block(inputs, filters, k=2, strides=1, stack_n=1):
+    shortcut = inputs
+    
+    x = BatchNormalization(momentum=0.9, epsilon=1e-5)(inputs)
+    x = Activation('relu')(x)
+    
+    x = Conv2D(k*filters, kernel_size=3, strides=strides, padding='same', kernel_initializer='he_normal',
+               kernel_regularizer=regularizers.l2(weight_decay))(x)
+    x = BatchNormalization(momentum=0.9, epsilon=1e-5)(x)
+    x = Activation('relu')(x)
+    x = Conv2D(filters*k, kernel_size=3, strides=1, padding='same', kernel_initializer='he_normal',
+               kernel_regularizer=regularizers.l2(weight_decay))(x)
+    
+    if strides != 1 or inputs.shape[-1] != filters*k:
+        shortcut = Conv2D(filters*k, kernel_size=1, strides=strides, padding='same', kernel_initializer='he_normal',
+                          kernel_regularizer=regularizers.l2(weight_decay))(shortcut)
+        
+    x = Add()([x, shortcut])
+    
+    for i in range(1, stack_n):
+        shortcut = x
+        x = BatchNormalization(momentum=0.9, epsilon=1e-5)(x)
+        x = Activation('relu')(x)
+        x = Conv2D(k*filters, kernel_size=3, strides=1, padding='same', kernel_initializer='he_normal',
+                   kernel_regularizer=regularizers.l2(weight_decay))(x)
+        x = BatchNormalization(momentum=0.9, epsilon=1e-5)(x)
+        x = Activation('relu')(x)
+        x = Conv2D(filters*k, kernel_size=3, strides=1, padding='same', kernel_initializer='he_normal',
+                   kernel_regularizer=regularizers.l2(weight_decay))(x)
+        x = Add()([x, shortcut])
+    
+    return x
 
-# # Validation 데이터 불러오기
-# validation_generator = datagen.flow_from_dataframe(
-#     df,
-#     directory='Validation/', 
-#     x_col='filename',
-#     y_col='class',
-#     target_size=(150, 150), 
-#     batch_size=32,
-#     class_mode='categorical',
-#     subset='validation')
 
-# # CNN 모델 구성
-# model = tf.keras.models.Sequential([
-#     tf.keras.layers.Conv2D(32, (3,3), activation='relu', input_shape=(150, 150, 3)),
-#     tf.keras.layers.MaxPooling2D(2, 2),
-#     tf.keras.layers.Conv2D(64, (3,3), activation='relu'),
-#     tf.keras.layers.MaxPooling2D(2,2),
-#     tf.keras.layers.Conv2D(128, (3,3), activation='relu'),
-#     tf.keras.layers.MaxPooling2D(2,2),
-#     tf.keras.layers.Flatten(),
-#     tf.keras.layers.Dense(512, activation='relu'),
-#     tf.keras.layers.Dense(len(df['class'].unique()), activation='softmax')
-# ])
+def wide_resnet(input_shape, filters):
+    depth = 28
+    width = 10
+    stack  = (depth - 4) // 6
+    inputs = Input(shape=input_shape)
+    
+    x = Conv2D(filters[0], kernel_size=3, strides=1, padding='same', kernel_initializer='he_normal',
+               kernel_regularizer=regularizers.l2(weight_decay))(inputs)
+    
+    x = residual_block(x, filters[0], k=10, strides=1, stack_n=stack)
+    x = residual_block(x, filters[1], k=10, strides=2, stack_n=stack)
+    x = residual_block(x, filters[2], k=10, strides=2, stack_n=stack)
+    
+    x = BatchNormalization(momentum=0.9, epsilon=1e-5)(x)
+    x = Activation('relu')(x)
+    x = AveragePooling2D((8, 8))(x)
+    x = Flatten()(x)
+    outputs = Dense(3, activation='softmax', kernel_initializer='he_normal',
+                    kernel_regularizer=regularizers.l2(weight_decay))(x)
+    
+    model = tf.keras.models.Model(inputs=inputs, outputs=outputs)
+    return model
 
-# # 모델 컴파일
-# model.compile(loss='categorical_crossentropy',
-#               optimizer=tf.keras.optimizers.RMSprop(lr=1e-4),
-#               metrics=['accuracy'])
 
-# # 모델 학습
-# history = model.fit(
-#       train_generator,
-#       steps_per_epoch=100,
-#       epochs=30,
-#       validation_data=validation_generator,
-#       validation_steps=50,
-#       verbose=2)
+filters = [8, 8, 16]
+
+
+def scheduler(epoch):
+    lr_min=1e-5
+    lr_max = 3e-1
+    cos_inner = (math.pi * epoch) / 70
+    lr = lr_max / 2 * (math.cos(cos_inner) + 1)
+    return max(lr, lr_min)
+
+
+# 모델 컴파일
+Callback = [LearningRateScheduler(scheduler)]
+sgd = optimizers.SGD(lr=.1, momentum=0.9, nesterov=True)
+
+model = wide_resnet(input_shape=(224, 224, 3), filters=filters)
+model.compile(loss='categorical_crossentropy',optimizer=sgd, metrics=['accuracy'])
+model.summary()
+
+# 모델 학습
+history = model.fit(
+      train_generator,
+      epochs=70,
+      validation_data=validation_generator,
+      verbose=1)
+
+#모델 세이브
+model.save('model/ResNet50V2_fine_tuned.h5')
+tf.saved_model.save(model, 'fine_tuned_saved_model')
